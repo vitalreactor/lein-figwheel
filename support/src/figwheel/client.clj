@@ -1,11 +1,7 @@
-(ns figwheel.client
-  (:require
-   [cljs.compiler :refer (munge)])
-  (:refer-clojure :exclude (munge defonce)))
+(ns figwheel.client)
 
-(defmacro defonce
-  [vname expr]
-  (let [ns (-> &env :ns :name name munge)
-        mname (munge (str vname))]
-    `(when-not (.hasOwnProperty ~(symbol "js" ns) ~mname)
-       (def ~vname ~expr))))
+;; this is a dummy file to be kinder to people
+;; who are upgrading from the older figwheel
+;; the error message is too cryptic
+
+;; I'm sure I'm going to have some macros in here someday :)

@@ -1,8 +1,10 @@
 (ns example.core
   (:require
-   [figwheel.client :as fw :include-macros true]
+   [figwheel.client :as fw]
    [example.cube]
-   [crate.core]))
+   [crate.core])
+  (:require-macros
+   [example.macros :as m]))
 
 (enable-console-print!)
 
@@ -10,10 +12,20 @@
 ;; you must call this function to start the listener that reloads
 ;; the compiled javascript
 
-;; this is commented out because we are invoking it at the bottom of
-;; this file
-;; (fw/watch-and-reload
-;;   :jsload-callback (fn [] (ex2-reload)))
+(declare ex2-restart)
+
+(fw/start {
+  :websocket-url "ws://localhost:3449/figwheel-ws"
+  :on-jsload (fn []
+               (ex2-restart)
+               ;; this is a better way to reload the cube example
+               ;; which will reload even for non-local changes
+               ;; (example.cube/stop-and-start-ex3)
+               )
+  })
+
+(m/log (+ 1 2 2 3 4 5))
+
 
 ;; When you are writing reloadable code you have to protect things
 ;; that you don't want defined over and over.
@@ -22,7 +34,7 @@
 ;; You should see the changed statement printed out in the console of
 ;; your web inspector.
 
-(println "This is a reloaded print statement: modify me.")
+(println "This is a reloaded print statement: modify me now.")
 
 ;; Example 1:  simple crate based app
 
@@ -43,7 +55,7 @@
    [:input.example-color-select {:type "range" :min 0 :max 255 :value g :data-color "g"}]
    [:div "green: " g]
    [:input.example-color-select {:type "range" :min 0 :max 255 :value b :data-color "b"}]   
-   [:div "this is a cool blue: " b]])
+   [:div "this is a blue: " b]])
 
 (defn ex1-render [v]
   (.html (js/$ "#example-1") (crate.core/html 
@@ -113,16 +125,3 @@
 
 ;; start the app once
 (defonce start-ex2 (ex2-start))
-
-;; this is a better way to reload the cube example
-;; (defonce start-cube (example.cube/stop-and-start-ex3))
-
-;; IMPORTANT!!!
-;; Here we start the websocket listener
-(fw/watch-and-reload
- :jsload-callback (fn []
-                    (ex2-restart)
-                    ;; this is a better way to reload the cube example
-                    ;; which will reload even for non-local changes
-                    ;; (example.cube/stop-and-start-ex3)
-                    ))
