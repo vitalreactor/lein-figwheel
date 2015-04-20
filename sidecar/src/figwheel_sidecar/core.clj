@@ -1,6 +1,9 @@
 (ns figwheel-sidecar.core
   (:require
    [cljs.compiler]
+   [cljs.analyzer :as ana]
+   [cljs.env]
+   [cljs.analyzer.api :as ana-api]
    [compojure.route :as route]
    [compojure.core :refer [routes GET]]
    [ring.util.response :refer [resource-response]]
@@ -9,12 +12,13 @@
    [watchtower.core :as wt :refer [watcher compile-watcher watcher* ignore-dotfiles file-filter extensions]]
    [clojure.core.async :refer [go-loop <!! <! chan put! sliding-buffer timeout]]
    [clojure.string :as string]
+   [clojure.set :refer [difference union]]
    [clojure.edn :as edn]
    [clojure.java.io :refer [as-file] :as io]
    [digest]
-   [clojurescript-build.api :as bapi]
    [clj-stacktrace.core :refer [parse-exception]]
    [clj-stacktrace.repl :refer [pst-on]]
+   [clojurescript-build.api :as cbapi]
    [clojure.pprint :as p]))
 
 ;; get rid of fs dependancy
@@ -51,37 +55,57 @@
       ["emacsclient" "-n" (str "+" file-line) file-name] ;; we are emacs aware
       [open-file-command file-name file-line])))
 
-(defn handle-client-msg [server-state data]
+(defn handle-client-msg [{:keys [browser-callbacks] :as server-state} data]
   (when data
     (let [msg (read-msg data)]
-      (when-let [command (and (= "file-selected" (:figwheel-event msg))
-                              (get-open-file-command server-state msg))]
-        (try
-          (.exec (Runtime/getRuntime) (into-array String command))
-          (catch Exception e
-            (println "Figwheel: there was a problem running the open file command - " command))
-          )))))
+      (if (= "callback" (:figwheel-event msg))
+        (when-let [cb (get @browser-callbacks (:callback-name msg))]
+          (cb (:content msg)))
+        (when-let [command (and (= "file-selected" (:figwheel-event msg))
+                                (get-open-file-command server-state msg))]
+          (try
+            (.exec (Runtime/getRuntime) (into-array String command))
+            (catch Exception e
+              (println "Figwheel: there was a problem running the open file command - " command))))))))
+
+(defn add-build-id [{:keys [build-id]} msg]
+  (if build-id
+    (assoc msg :build-id build-id)
+    msg))
 
 (defn message* [opts msg-name data]
   (merge data
-         { :msg-name msg-name 
-           :project-id (:unique-id opts)}))
+         (add-build-id opts
+                       { :msg-name msg-name 
+                         :project-id (:unique-id opts)})))
 
-(defn setup-file-change-sender [{:keys [file-change-atom compile-wait-time] :as server-state}
+(defn update-connection-count [connection-count build-id f]
+  (swap! connection-count update-in [build-id] (fnil f 0)))
+
+(defn setup-file-change-sender [{:keys [file-change-atom compile-wait-time connection-count] :as server-state}
+                                {:keys [desired-build-id] :as params}
                                 wschannel]
   (let [watch-key (keyword (gensym "message-watch-"))]
+    (update-connection-count connection-count desired-build-id inc)
     (add-watch file-change-atom
                watch-key
                (fn [_ _ o n]
                  (let [msg (first n)]
-                   (when msg
+                   (when (and msg (or
+                                   ;; broadcast all css messages
+                                   (= :css-files-changed (:msg-name msg))
+                                   ;; if its nil you get it all
+                                   (nil? desired-build-id)
+                                   ;; otherwise you only get messages for your build id
+                                   (= desired-build-id (:build-id msg))))
                      (<!! (timeout compile-wait-time))
                      (when (open? wschannel)
                        (send! wschannel (prn-str msg)))))))
     
     (on-close wschannel (fn [status]
+                          (update-connection-count connection-count desired-build-id dec)
                           (remove-watch file-change-atom watch-key)
-                          (println "Figwheel: client disconnected " status)))
+                          #_(println "Figwheel: client disconnected " status)))
 
     (on-receive wschannel (fn [data] (handle-client-msg server-state data)))
 
@@ -95,24 +119,43 @@
 (defn reload-handler [server-state]
   (fn [request]
     (with-channel request channel
-      (setup-file-change-sender server-state channel))))
+      (setup-file-change-sender server-state (:params request) channel))))
 
 (defn server
   "This is the server. It is complected and its OK. Its trying to be a basic devel server and
    also provides the figwheel websocket connection."
   [{:keys [ring-handler server-port http-server-root ring-handler] :as server-state}]
-  (-> (routes
-       (GET "/figwheel-ws" [] (reload-handler server-state))
-       (route/resources "/" {:root http-server-root})
-       (or ring-handler (fn [r] false))
-       (GET "/*" [] (resource-response "index.html" {:root http-server-root}))
-       (route/not-found "<h1>Page not found</h1>"))
-      ;; adding cors to support @font-face which has a strange cors error
-      ;; super promiscuous please don't uses figwheel as a production server :)
-      (cors/wrap-cors
-       :access-control-allow-origin #".*"
-       :access-control-allow-methods [:head :options :get])
-      (run-server {:port server-port})))
+
+  ;; (-> (routes
+  ;;      (GET "/figwheel-ws" [] (reload-handler server-state))
+  ;;      (route/resources "/" {:root http-server-root})
+  ;;      (or ring-handler (fn [r] false))
+  ;;      (GET "/*" [] (resource-response "index.html" {:root http-server-root}))
+  ;;      (route/not-found "<h1>Page not found</h1>"))
+  ;;     ;; adding cors to support @font-face which has a strange cors error
+  ;;     ;; super promiscuous please don't uses figwheel as a production server :)
+  ;;     (cors/wrap-cors
+  ;;      :access-control-allow-origin #".*"
+  ;;      :access-control-allow-methods [:head :options :get])
+  ;;     (run-server {:port server-port}))
+
+  (try
+    (-> (routes
+         (GET "/figwheel-ws/:desired-build-id" {params :params} (reload-handler server-state))
+         (GET "/figwheel-ws" {params :params} (reload-handler server-state))       
+         (route/resources "/" {:root http-server-root})
+         (or ring-handler (fn [r] false))
+         (GET "/" [] (resource-response "index.html" {:root http-server-root}))
+         (route/not-found "<h1>Page not found</h1>"))
+        ;; adding cors to support @font-face which has a strange cors error
+        ;; super promiscuous please don't uses figwheel as a production server :)
+        (cors/wrap-cors
+         :access-control-allow-origin #".*"
+         :access-control-allow-methods [:head :options :get :put :post :delete])
+        (run-server {:port server-port}))
+    (catch java.net.BindException e
+      (println "Port" server-port "is already being used. Are you running another Figwheel instance? If you want to run two Figwheel instances add a new :server-port (i.e. :server-port 3450) to Figwheel's config options in your project.clj")
+      (System/exit 0))))
 
 (defn append-msg [q msg] (conj (take 30 q) msg))
 
@@ -139,14 +182,10 @@
   .ie a file that starts with (ns example.path-finder) -> example.path_finder"
   [file-path]
   (try
-    
     (when (.exists (as-file file-path))
       (with-open [rdr (io/reader file-path)]
-        (-> (java.io.PushbackReader. rdr)
-            read
-            second
-            #_name
-            #_underscore)))
+        (let [forms (ana/forms-seq* rdr file-path)]
+          (second (first forms)))))
     (catch java.lang.RuntimeException e
       nil)))
 
@@ -173,39 +212,32 @@
                  ;; need to test this
                  (filter #(= ".cljs" (second (split-ext %)))
                          (keys new-mtimes))
-                 (:cljs changed-source-file-paths))))))
+                 (concat (:cljs changed-source-file-paths)
+                         (:cljc changed-source-file-paths)))))))
 
 (let [root (norm-path (.getCanonicalPath (io/file ".")))]
-  (defn relativize-resource-paths
+  (defn remove-root-path 
     "relativize to the local root just in case we have an absolute path"
-    [{:keys [resource-paths]}]
-    (mapv #(string/replace-first (norm-path %)
-                                 (str (norm-path root)
-                                      "/") "") resource-paths)))
+    [path]
+    (string/replace-first (norm-path path) (str root "/") "")))
 
-(defn remove-resource-path [{:keys [http-server-root] :as state} path]
-  (let [path' (norm-path path)
-        rp (first (filter (fn [x] (.startsWith path' (str x "/" http-server-root)))
-                          (relativize-resource-paths state)))
-        to-remove (str rp "/" http-server-root)]
-    (string/replace path' to-remove "")))
-
-(defn ns-to-server-relative-path
-  "Given the state and a namespace makes a path relative to the server root.
-  This is a path that a client can request. A caveat is that only works on
-  compiled javascript namespaces."
-  [{:keys [output-dir] :as state} ns]
-  (let [path (.getPath (bapi/cljs-target-file-from-ns output-dir ns))]
-    (remove-resource-path state path)))
-
-(defn make-serve-from-display [{:keys [http-server-root] :as opts}]
-  (let [paths (relativize-resource-paths opts)]
-    (str "(" (string/join "|" paths) ")/" http-server-root)))
 
 (defn file-changed?
   "Standard md5 check to see if a file actually changed."
   [{:keys [file-md5-atom]} filepath]  
   (let [file (as-file filepath)]
+    (when (.exists file)
+      (let [contents (slurp file)]
+        (when (.contains contents "addDependency")
+          (let [check-sum (digest/md5 contents)
+                changed? (not= (get @file-md5-atom filepath)
+                               check-sum)]
+            (swap! file-md5-atom assoc filepath check-sum)
+            changed?))))))
+
+(defn target-file-changed? [{:keys [file-md5-atom] :as st} ns-sym]
+  (let [file (cbapi/cljs-target-file-from-ns (:output-dir st) ns-sym)
+        filepath (str file)]
     (when (.exists file)
       (let [check-sum (digest/md5 file)
             changed? (not= (get @file-md5-atom filepath)
@@ -214,7 +246,7 @@
         changed?))))
 
 (defn dependency-files [{:keys [output-to output-dir]}]
-   [output-to (str output-dir "/goog/deps.js")])
+   [output-to (str output-dir "/goog/deps.js") (str output-dir "/cljs_deps.js")])
 
 (defn get-dependency-files
   "Handling dependency files is different they don't have namespaces and their mtimes
@@ -224,18 +256,85 @@
   (keep
    #(when (file-changed? st %)
       { :dependency-file true
-        :file (remove-resource-path st %)})
+        :type :dependency-update
+        :file (remove-root-path %)
+        :eval-body (slurp %)})
    (dependency-files st)))
+
+;; inlining this for now so that people can use it now
+
+(defn get-deps [ns]
+  (letfn [(parent? [parent [child {:keys [requires] :as ns-info}]]
+             (when-not (= parent child)
+               (cond
+                 (or (map? requires)
+                     (set? requires)) (contains? requires parent)
+                     (vector? requires) (some #{(munge (name parent))} requires))))]
+    (set
+     (map first
+          (filter
+           #(parent? ns %)
+           (get @cljs.env/*compiler* :cljs.analyzer/namespaces))))))
+
+(def ^:dynamic *memo-get-deps* false)
+
+(declare cljs-topo-sort)
+
+(defn sort-and-expand-ns
+  ([deps]
+   (sort-and-expand-ns deps 0 (atom (sorted-map))))
+  ([deps depth state]
+   (swap! state update-in [depth] (fnil into #{}) deps)
+   (doseq [dep deps]
+     (cljs-topo-sort dep (inc depth) state))
+   (doseq [[<depth _] (subseq @state < depth)]
+     (swap! state update-in [<depth] difference deps))
+   (when (= depth 0)
+     (distinct (apply concat (vals @state))))))
+
+;; from cljs.util; will use that one in when it hits mainstream
+(defn cljs-topo-sort [x depth state]
+  (sort-and-expand-ns (*memo-get-deps* x) depth state))
+
+(defn topo-sort [ns-syms]
+  (let [all-syms (set (map name ns-syms))]
+    (filter #(all-syms (name %))
+            (sort-and-expand-ns ns-syms))))
+
+(defn mark-changed-ns [state ns-syms]
+  (set
+   (mapv (fn [nm]
+           (vary-meta nm assoc :file-changed-on-disk
+                      (if (target-file-changed? state nm) true false)))
+         ns-syms)))
+
+(defn find-figwheel-always []
+  (filter (fn [n] (-> n meta :figwheel-always)) (ana-api/all-ns)))
+
+(defn all-ns-to-load [changed-ns-syms]
+  (set (concat (keep (fn [n] (:name (ana-api/find-ns n))) changed-ns-syms)
+               (find-figwheel-always))))
+
+(defn expand-to-all-ns [state changed-ns-syms']
+  (cond
+    (nil? cljs.env/*compiler*) changed-ns-syms'
+    (false? (:recompile-dependents state))
+    (topo-sort (all-ns-to-load changed-ns-syms'))
+    :else
+    ;;     (mark-changed-ns state ) may not be worth it
+    (sort-and-expand-ns (all-ns-to-load changed-ns-syms'))))
+
+(defn dependents-info [n]
+  (vec (ana/ns-dependents n)))
 
 (defn make-sendable-file
   "Formats a namespace into a map that is ready to be sent to the client."
   [st nm]
   (let [n (-> nm name underscore)]
-    { :file (ns-to-server-relative-path st n)
+    { :file (str (cbapi/cljs-target-file-from-ns "" nm))
       :namespace (cljs.compiler/munge n)
-      :meta-data (meta nm)}
-    ))
-
+      :type :namespace
+      :meta-data (meta nm)}))
 
 ;; I would love to just check the compiled javascript files to see if
 ;; they changed and then just send them to the browser. There is a
@@ -255,9 +354,10 @@
 
 (defn notify-cljs-ns-changes [state ns-syms]
   (->> ns-syms
-       (map (partial make-sendable-file state))
-       (concat (get-dependency-files state))
-       (send-changed-files state)))
+    (expand-to-all-ns state)
+    (map (partial make-sendable-file state))
+    (concat (get-dependency-files state))
+    (send-changed-files state)))
 
 ;; this functionality should be moved to autobuilder or a new ns
 ;; this ns should just be for notifications?
@@ -274,10 +374,14 @@
   ;; this is the new way where if additional changes are needed they
   ;; are made explicitely
   ([state old-mtimes new-mtimes additional-ns]
-     (notify-cljs-ns-changes state
-      (set (concat additional-ns
-              (keep get-ns-from-source-file-path
-                    (:cljs (get-changed-source-file-paths old-mtimes new-mtimes))))))))
+   (binding [*memo-get-deps* (memoize get-deps)]
+     (let [change-source-file-paths (get-changed-source-file-paths old-mtimes new-mtimes)]
+       (notify-cljs-ns-changes state
+                               (set (concat additional-ns 
+                                            (keep get-ns-from-source-file-path
+                                                  (concat
+                                                   (:cljs change-source-file-paths)
+                                                   (:cljc change-source-file-paths))))))))))
 
 ;; css changes
 ;; this can be moved out of here I think
@@ -297,7 +401,7 @@
       (map (fn [x] (.getPath x)) (updated?)))))
 
 (defn make-css-file [state path]
-  { :file (remove-resource-path state path)
+  { :file (remove-root-path path)
     :type :css } )
 
 (defn send-css-files [st files]
@@ -323,38 +427,50 @@
                               (.toString out))]
     (send-message! st :compile-failed
                    { :exception-data parsed-exception
-                    :formatted-exception formatted-exception })))
+                     :formatted-exception formatted-exception })))
 
 (defn compile-warning-occured [st msg]
   (send-message! st :compile-warning { :message msg }))
 
 (defn initial-check-sums [state]
-  (doseq [df (dependency-files state)]
-    (file-changed? state df))
+  (when (and (:output-dir state)
+             (:output-to state))
+    (doseq [df (dependency-files state)]
+      (file-changed? state df)))
   (:file-md5-atom state))
 
 (defn create-initial-state [{:keys [root name version resource-paths
                                     css-dirs ring-handler http-server-root
                                     server-port output-dir output-to
                                     unique-id
+                                    server-logfile
+                                    repl
                                     open-file-command] :as opts}]
   ;; I'm spelling this all out as a reference
   { :unique-id (or unique-id (project-unique-id)) 
-   
-    :resource-paths (or resource-paths ["resources"])
+     
+    :resource-paths (or
+                     (and resource-paths
+                          (empty? resource-paths)
+                          ["resources"])
+                     resource-paths
+                     ["resources"])
     :css-dirs css-dirs
     :http-server-root (or http-server-root "public")
     :output-dir output-dir
     :output-to output-to
     :ring-handler ring-handler
     :server-port (or server-port 3449)
-    
+    :server-logfile server-logfile
+    :repl repl
     :css-last-pass (atom (System/currentTimeMillis))   
     :compile-wait-time 10
     :file-md5-atom (initial-check-sums {:output-to output-to
                                         :output-dir output-dir
                                         :file-md5-atom (atom {})})
     :file-change-atom (atom (list))
+    :browser-callbacks (atom {})
+    :connection-count (atom {})
     :open-file-command open-file-command
    })
 
@@ -364,12 +480,13 @@
          (when ring-handler
            (eval (symbol ring-handler)))))
 
-(defn start-server [opts]
-  (let [state (create-initial-state (resolve-ring-handler opts))]
-    (println (str "Figwheel: Starting server at http://localhost:" (:server-port state)))
-    (println (str "Figwheel: Serving files from '"
-                  (make-serve-from-display state) "'"))
-    (assoc state :http-server (server state))))
+(defn start-server
+  ([] (start-server {}))
+  ([opts]
+   (let [state (create-initial-state (resolve-ring-handler opts))]
+     (println (str "Figwheel: Starting server at http://localhost:" (:server-port state)))
+     (assoc state :http-server (server state)))))
 
 (defn stop-server [{:keys [http-server]}]
   (http-server))
+

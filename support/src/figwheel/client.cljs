@@ -3,12 +3,34 @@
    [goog.Uri :as guri]
    [cljs.core.async :refer [put! chan <! map< close! timeout alts!] :as async]
    [figwheel.client.socket :as socket]
+   [figwheel.client.utils :as utils]   
    [figwheel.client.heads-up :as heads-up]
-   [figwheel.client.file-reloading :as reloading])
+   [figwheel.client.file-reloading :as reloading]
+   [clojure.string :as string]
+   ;; to support repl doc
+   [cljs.repl])
   (:require-macros
    [cljs.core.async.macros :refer [go go-loop]]))
 
 ;; exception formatting
+
+(defn figwheel-repl-print [args]
+  (socket/send! {:figwheel-event "callback"
+                 :callback-name "figwheel-repl-print"
+                 :content args})
+  args)
+
+(defn console-print [args]
+  (.apply (.-log js/console) js/console (into-array args))
+  args)
+
+(defn enable-repl-print! []
+  (set! *print-newline* false)
+  (set! *print-fn*
+        (fn [& args]
+          (-> args
+            console-print
+            figwheel-repl-print))))
 
 (defn get-essential-messages [ed]
   (when ed
@@ -54,8 +76,6 @@
 (defn css-loaded-state? [msg-names]
   (= :css-files-changed (first msg-names)))
 
-;; plugins
-
 (defn file-reloader-plugin [opts]
   (let [ch (chan)]
     (go-loop []
@@ -66,12 +86,65 @@
                  #_(.log js/console (prn-str msg))
                  (cond
                   (reload-file-state? msg-names opts)
-                  (<! (reloading/reload-js-files opts msg))
-
+                  (alts! [(reloading/reload-js-files opts msg) (timeout 1000)])
+                  
                   (block-reload-file-state? msg-names opts)
                   (.warn js/console "Figwheel: Not loading code with warnings - " (-> msg :files first :file)))
                  (recur))))
     (fn [msg-hist] (put! ch msg-hist) msg-hist)))
+
+#_(defn error-test2 []
+  js/joe)
+
+#_(defn error-test3 []
+  (error-test2))
+
+#_(defn error-test []
+   (error-test3))
+
+(defn truncate-stack-trace [stack-str]
+  (take-while #(not (re-matches #".*eval_javascript_STAR__STAR_.*" %))
+              (string/split-lines stack-str)))
+
+(let [base-path (string/replace (.-basePath js/goog) #"(.*)goog/" #(str %2))]
+  (defn eval-javascript** [code result-handler]
+    (try
+      (binding [*print-fn* (fn [& args]
+                             (-> args
+                               console-print
+                               figwheel-repl-print))
+                *print-newline* false]
+        (result-handler
+         {:status :success,
+          :value (str (js* "eval(~{code})"))}))
+      (catch js/Error e
+        (result-handler
+         {:status :exception
+          :value (pr-str e)
+          :stacktrace (string/join "\n" (truncate-stack-trace (.-stack e)))
+          :base-path base-path }))
+    (catch :default e
+      (result-handler
+       {:status :exception
+        :value (pr-str e)
+        :stacktrace "No stacktrace available."})))))
+
+(defn ensure-cljs-user
+  "The REPL can disconnect and reconnect lets ensure cljs.user exists at least."
+  []
+  ;; this should be included in the REPL
+  (when-not js/cljs.user
+    (set! js/cljs.user #js {})))
+
+(defn repl-plugin [{:keys [build-id] :as opts}]
+  (fn [[{:keys [msg-name] :as msg} & _]]
+    (when (= :repl-eval msg-name)
+      (ensure-cljs-user)
+      (eval-javascript** (:code msg)
+       (fn [res]
+         (socket/send! {:figwheel-event "callback"
+                        :callback-name (:callback-name  msg)
+                        :content res}))))))
 
 (defn css-reloader-plugin [opts]
   (fn [[{:keys [msg-name] :as msg} & _]]
@@ -93,7 +166,9 @@
     (go
      (cond
       (reload-file-state? msg-names opts)
-      (<! (heads-up/flash-loaded))
+      (if (:autoload opts)
+        (<! (heads-up/flash-loaded))
+        (<! (heads-up/clear)))
 
       (compile-refail-state? msg-names)
       (do
@@ -149,47 +224,55 @@
 ;; document.body.addEventListener("figwheel.js-reload", function (e) { console.log(e.detail);} );
 
 (defn default-on-jsload [url]
-  (when (js*  "(\"CustomEvent\" in window)")
+  (when (and (utils/html-env?) (js*  "(\"CustomEvent\" in window)"))
     (.dispatchEvent (.-body js/document)
                     (js/CustomEvent. "figwheel.js-reload"
                                      (js-obj "detail" url)))))
 
-
 (defn default-on-compile-fail [{:keys [formatted-exception exception-data] :as ed}]
-  (.debug js/console "Figwheel: Compile Exception")
+  (utils/log :debug "Figwheel: Compile Exception")
   (doseq [msg (format-messages exception-data)]
-    (.log js/console msg))
+    (utils/log :info msg))
   ed)
 
 (defn default-on-compile-warning [{:keys [message] :as w}]
-  (.warn js/console "Figwheel: Compile Warning -" message)
+  (utils/log :warn (str "Figwheel: Compile Warning - " message))
   w)
 
-
 (defn default-before-load [files]
-  (.debug js/console "Figwheel: notified of file changes")
+  (utils/log :debug "Figwheel: notified of file changes")
   files)
 
 (defn default-on-cssload [files]
-  (.debug js/console "Figwheel: loaded CSS files")
-  (.log js/console (pr-str (map :file files)))
+  (utils/log :debug "Figwheel: loaded CSS files")
+  (utils/log :info (pr-str (map :file files)))  
   files)
 
 (defonce config-defaults
   {:retry-count 100
-   :websocket-url (str "ws://" js/location.host "/figwheel-ws")
+   :websocket-url (str "ws://"
+                       (if (utils/html-env?) js/location.host "localhost:3449")
+                       "/figwheel-ws")
    :load-warninged-code false
    
    :on-jsload default-on-jsload
    :before-jsload default-before-load
-   :url-rewriter identity
+
+   :url-rewriter false
 
    :on-cssload default-on-cssload
    
    :on-compile-fail default-on-compile-fail
    :on-compile-warning default-on-compile-warning
+
+   :autoload true
    
-   :heads-up-display true })
+   :debug false
+   
+   :heads-up-display true
+
+   :load-unchanged-files true
+   })
 
 (defn handle-deprecated-jsload-callback [config]
   (if (:jsload-callback config)
@@ -202,8 +285,19 @@
   (let [base {:enforce-project-plugin enforce-project-plugin
               :file-reloader-plugin     file-reloader-plugin
               :comp-fail-warning-plugin compile-fail-warning-plugin
-              :css-reloader-plugin      css-reloader-plugin}]
-    (if (:heads-up-display system-options)
+              :css-reloader-plugin      css-reloader-plugin
+              :repl-plugin      repl-plugin}
+       base  (if (not (.. js/goog inHtmlDocument_)) ;; we are in node?
+               (select-keys base [#_:enforce-project-plugin
+                                  :file-reloader-plugin
+                                  :comp-fail-warning-plugin
+                                  :repl-plugin])
+               base)
+        base (if (false? (:autoload system-options))
+               (dissoc base :file-reloader-plugin)
+               base)]
+    (if (and (:heads-up-display system-options)
+             (utils/html-env?))
       (assoc base :heads-up-display-plugin heads-up-plugin)
       base)))
 
@@ -211,12 +305,14 @@
   (doseq [[k plugin] plugins]
     (when plugin
       (let [pl (plugin system-options)]
-        (add-watch socket/message-history-atom k (fn [_ _ _ msg-hist] (pl msg-hist)))))))
+        (add-watch socket/message-history-atom k
+                   (fn [_ _ _ msg-hist] (pl msg-hist)))))))
 
 (defn start
   ([opts]
-     (defonce __figwheel-start-once__
-       (let [plugins' (:plugins opts) ;; plugins replaces all plugins
+   (defonce __figwheel-start-once__
+     (js/setTimeout
+      #(let [plugins' (:plugins opts) ;; plugins replaces all plugins
              merge-plugins (:merge-plugins opts) ;; merges plugins
              system-options (handle-deprecated-jsload-callback
                              (merge config-defaults
@@ -224,9 +320,11 @@
              plugins  (if plugins'
                         plugins'
                         (merge (base-plugins system-options) merge-plugins))]
+         (set! utils/*print-debug* (:debug opts))
+         #_(enable-repl-print!)         
          (add-plugins plugins system-options)
          (reloading/patch-goog-base)
-         (socket/open system-options))))
+         (socket/open system-options)))))
   ([] (start {})))
 
 ;; legacy interface
