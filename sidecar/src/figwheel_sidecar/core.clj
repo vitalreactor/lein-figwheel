@@ -125,27 +125,13 @@
   "This is the server. It is complected and its OK. Its trying to be a basic devel server and
    also provides the figwheel websocket connection."
   [{:keys [ring-handler server-port http-server-root ring-handler] :as server-state}]
-
-  ;; (-> (routes
-  ;;      (GET "/figwheel-ws" [] (reload-handler server-state))
-  ;;      (route/resources "/" {:root http-server-root})
-  ;;      (or ring-handler (fn [r] false))
-  ;;      (GET "/*" [] (resource-response "index.html" {:root http-server-root}))
-  ;;      (route/not-found "<h1>Page not found</h1>"))
-  ;;     ;; adding cors to support @font-face which has a strange cors error
-  ;;     ;; super promiscuous please don't uses figwheel as a production server :)
-  ;;     (cors/wrap-cors
-  ;;      :access-control-allow-origin #".*"
-  ;;      :access-control-allow-methods [:head :options :get])
-  ;;     (run-server {:port server-port}))
-
   (try
     (-> (routes
          (GET "/figwheel-ws/:desired-build-id" {params :params} (reload-handler server-state))
          (GET "/figwheel-ws" {params :params} (reload-handler server-state))       
          (route/resources "/" {:root http-server-root})
          (or ring-handler (fn [r] false))
-         (GET "/" [] (resource-response "index.html" {:root http-server-root}))
+         (GET "/*" [] (resource-response "index.html" {:root http-server-root}))
          (route/not-found "<h1>Page not found</h1>"))
         ;; adding cors to support @font-face which has a strange cors error
         ;; super promiscuous please don't uses figwheel as a production server :)
