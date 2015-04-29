@@ -63,10 +63,8 @@
     (GET "/figwheel-ws" [] (reload-handler server-state))
     (route/resources "/" :root http-server-root)
     (or ring-handler (fn [r] false))
-    (GET "/" [] (resource-response "index.html" {:root http-server-root}))
-    (if friendly-url?
-      (GET "/*" [] (resource-response "index.html" {:root http-server-root}))
-      (route/not-found "<h1>Page not found</h1>")))
+    (GET "/*" [] (resource-response "index.html" {:root http-server-root}))
+    (route/not-found "<h1>Page not found</h1>"))
    {:port server-port}))
 
 (defn append-msg [q msg]
