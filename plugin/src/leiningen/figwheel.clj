@@ -8,20 +8,7 @@
    [clojure.java.io :as io]
    [figwheel-sidecar.config :as fc]))
 
-(def figwheel-sidecar-version
-  (let [[_ coords version]
-        (-> (or (io/resource "META-INF/leiningen/figwheel-sidecar/figwheel-sidecar/project.clj")
-                ; this should only ever come into play when testing figwheel-sidecar itself
-                "project.clj")
-            slurp
-            read-string)]
-    (assert (= coords 'figwheel-sidecar)
-            (str "Something very wrong, could not find figwheel-sidecar's project.clj, actually found: "
-                 coords))
-    (assert (string? version)
-            (str "Something went wrong, version of figwheel-sidecar is not a string: "
-                 version))
-    version))
+(def figwheel-sidecar-version "0.2.7")
 
 ;; well this is private in the leiningen.cljsbuild ns
 (defn- run-local-project [project crossover-path builds requires form]
